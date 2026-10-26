@@ -18,7 +18,6 @@ import sys
 import sysconfig
 import tempfile
 import threading
-import time
 import unittest
 
 
@@ -86,8 +85,6 @@ class InputAPIRegression(unittest.TestCase):
     def setUp(self):
         self.sdk.close()
         self.native.xrt_test_init_result(0)
-        self.sdk.set_device_id("headset-A")
-        self.sdk.set_input_timeout_ms(500)
         self.sdk.init()
         self.event(1 << 2)
 
@@ -99,47 +96,43 @@ class InputAPIRegression(unittest.TestCase):
     def event(self, kind, device=None):
         self.native.xrt_test_emit_event(kind, None if device is None else device.encode())
 
-    def assert_neutral(self, status):
-        snapshot = self.sdk.get_input_snapshot()
-        self.assertFalse(snapshot["valid"])
-        self.assertEqual(snapshot["status"], status)
-        self.assertEqual(snapshot["data"], {})
+    def assert_neutral(self):
         self.assertEqual(self.sdk.get_left_controller_pose(), [0.0] * 7)
         self.assertEqual(self.sdk.get_right_controller_pose(), [0.0] * 7)
+        self.assertEqual(self.sdk.get_headset_pose(), [0.0] * 7)
         self.assertEqual(self.sdk.get_left_grip(), 0.0)
         self.assertEqual(self.sdk.get_right_grip(), 0.0)
         self.assertFalse(self.sdk.get_X_button())
         self.assertEqual(self.sdk.get_time_stamp_ns(), 0)
 
-    def test_explicit_binding_filters_interleaved_devices(self):
-        for marker in range(1, 41):
-            self.emit(value=frame(marker))
-            self.emit("headset-B", frame(0, 0.0))
-            self.assertEqual(self.sdk.get_left_controller_pose()[0], marker)
-            self.assertEqual(self.sdk.get_right_grip(), 1.0)
-            self.assertEqual(self.sdk.get_input_snapshot()["device_id"], "headset-A")
-
-    def test_first_frame_binding_is_sticky_after_missing_and_reinit(self):
-        self.sdk.set_device_id("")
-        self.emit("headset-B", raw="{")
-        self.emit("headset-A", frame(10))
-        self.event(1 << 5, "headset-A")
-        self.emit("headset-B", frame(20))
-        self.assert_neutral("device_missing")
-        self.sdk.close()
-        self.sdk.init()
-        self.emit("headset-B", frame(30))
-        self.assert_neutral("waiting")
-        self.emit(value=frame(40))
-        self.assertEqual(self.sdk.get_time_stamp_ns(), 40)
-
-    def test_unrelated_missing_and_device_find_do_not_change_binding(self):
+    def test_online_devices_keep_legacy_receiving_behavior(self):
         self.emit()
-        generation = self.sdk.get_input_snapshot()["generation"]
+        self.emit("headset-B", frame(2, 0.5))
+        self.assertEqual(self.sdk.get_left_controller_pose()[0], 2)
+        self.assertEqual(self.sdk.get_right_grip(), 0.5)
+        for name in ("set_device_id", "set_input_timeout_ms",
+                     "is_input_valid", "get_input_snapshot"):
+            self.assertFalse(hasattr(self.sdk, name))
+
+    def test_unrelated_missing_does_not_clear_current_values(self):
+        self.emit()
         self.event(1 << 5, "headset-B")
-        self.event(1 << 4, "headset-B")
-        self.assertTrue(self.sdk.is_input_valid())
-        self.assertEqual(self.sdk.get_input_snapshot()["generation"], generation)
+        self.assertEqual(self.sdk.get_left_grip(), 1.0)
+        self.assertEqual(self.sdk.get_headset_pose()[0], 1)
+
+    def test_missing_clears_only_domains_owned_by_that_device(self):
+        self.emit()
+        self.emit("headset-B", {
+            "Controller": {}, "Hand": {},
+            "Head": {"pose": "2,0,0,0,0,0,1"}, "timeStampNs": 2,
+        })
+        self.event(1 << 5, "headset-A")
+        self.assertEqual(self.sdk.get_left_controller_pose(), [0.0] * 7)
+        self.assertEqual(self.sdk.get_right_grip(), 0.0)
+        self.assertEqual(self.sdk.get_headset_pose()[0], 2)
+        self.assertEqual(self.sdk.get_time_stamp_ns(), 2)
+        self.event(1 << 5, "headset-B")
+        self.assert_neutral()
 
     def test_target_missing_clears_all_modalities(self):
         value = frame()
@@ -157,156 +150,124 @@ class InputAPIRegression(unittest.TestCase):
         self.assertEqual(self.sdk.num_motion_data_available(), 1)
         self.assertEqual(self.sdk.get_left_hand_is_active(), 1)
         self.event(1 << 5, "headset-A")
-        self.assert_neutral("device_missing")
+        self.assert_neutral()
         self.assertFalse(self.sdk.is_body_data_available())
+        self.assertEqual(self.sdk.get_body_joints_pose(), [[0.0] * 7] * 24)
+        self.assertEqual(self.sdk.get_body_joints_velocity(), [[0.0] * 6] * 24)
+        self.assertEqual(self.sdk.get_body_joints_acceleration(), [[0.0] * 6] * 24)
         self.assertEqual(self.sdk.get_body_joints_timestamp(), [0] * 24)
+        self.assertEqual(self.sdk.get_body_timestamp_ns(), 0)
         self.assertEqual(self.sdk.get_motion_tracker_pose(), [])
+        self.assertEqual(self.sdk.get_motion_tracker_velocity(), [])
+        self.assertEqual(self.sdk.get_motion_tracker_acceleration(), [])
         self.assertEqual(self.sdk.get_motion_tracker_serial_numbers(), [])
+        self.assertEqual(self.sdk.get_motion_timestamp_ns(), 0)
         self.assertEqual(self.sdk.get_left_hand_is_active(), 0)
         self.assertEqual(self.sdk.get_right_hand_tracking_state(), [[0.0] * 7] * 26)
 
-    def test_service_disconnect_clears_until_new_target_frame(self):
+    def test_late_missing_frames_cannot_restore_values_before_online_event(self):
         self.emit()
-        generation = self.sdk.get_input_snapshot()["generation"]
-        self.event(1 << 3)
-        self.assert_neutral("server_disconnected")
-        self.assertFalse(self.sdk.get_input_snapshot()["service_connected"])
-        self.event(1 << 2)
-        self.event(1 << 4, "headset-A")
-        self.assertFalse(self.sdk.is_input_valid())
-        self.emit("headset-B", frame(2))
-        self.assertFalse(self.sdk.is_input_valid())
-        self.emit(value=frame(3))
-        self.assertTrue(self.sdk.is_input_valid())
-        self.assertGreater(self.sdk.get_input_snapshot()["generation"], generation)
-
-    def test_stale_is_not_disconnected_and_other_device_cannot_refresh_age(self):
-        self.sdk.set_input_timeout_ms(20)
-        self.emit()
-        time.sleep(0.04)
-        self.emit("headset-B", frame(2))
-        self.assert_neutral("stale")
-        snapshot = self.sdk.get_input_snapshot()
-        self.assertTrue(snapshot["service_connected"])
-        self.assertGreaterEqual(snapshot["age_ms"], 20)
-        generation = snapshot["generation"]
-        self.sdk.set_input_timeout_ms(500)
-        self.assert_neutral("stale")
-        self.emit()
-        self.assertTrue(self.sdk.is_input_valid())
-        self.assertEqual(self.sdk.get_input_snapshot()["generation"], generation)
-
-    def test_unobserved_timeout_is_recorded_before_next_frame(self):
-        self.sdk.set_input_timeout_ms(20)
-        self.emit()
-        generation = self.sdk.get_input_snapshot()["generation"]
-        time.sleep(0.04)
+        self.event(1 << 5, "headset-A")
         self.emit(value=frame(2))
-        self.assertTrue(self.sdk.is_input_valid())
-        self.assertGreater(self.sdk.get_input_snapshot()["generation"], generation)
+        self.assert_neutral()
+        self.event(1 << 4, "headset-A")
+        self.assert_neutral()
+        self.emit(value=frame(3))
+        self.assertEqual(self.sdk.get_left_controller_pose()[0], 3)
+
+    def test_service_disconnect_clears_and_blocks_late_frames_until_reconnect(self):
+        self.emit()
+        self.event(1 << 3)
+        self.emit(value=frame(2))
+        self.assert_neutral()
+        self.event(1 << 2)
+        self.assert_neutral()
+        self.emit(value=frame(3))
+        self.assertEqual(self.sdk.get_time_stamp_ns(), 3)
 
     def test_close_ignores_late_callbacks_and_is_idempotent(self):
         self.emit()
         self.sdk.close()
         count = self.native.xrt_test_close_calls()
         self.emit(value=frame(2))
-        self.assert_neutral("closed")
+        self.assert_neutral()
         self.sdk.close()
         self.assertEqual(self.native.xrt_test_close_calls(), count)
         self.sdk.init()
-        self.assert_neutral("waiting")
+        self.assert_neutral()
 
-    def test_malformed_selected_frame_never_publishes_partial_data(self):
+    def test_invalid_side_clears_pose_and_input_without_affecting_valid_side(self):
         self.emit()
         value = frame(2)
-        value["Controller"]["right"]["pose"] = "not-a-pose"
+        value["Controller"]["left"] = {"valid": False}
+        value["Controller"]["right"]["valid"] = True
         self.emit(value=value)
-        self.assert_neutral("invalid_frame")
-        for pose in ("1,2,3", "nan,0,0,0,0,0,1", "1,0,0,0,0,0,1,2"):
-            value = frame(3)
-            value["Controller"]["left"]["pose"] = pose
-            self.emit(value=value)
-            self.assert_neutral("invalid_frame")
-        self.emit()
-        self.assertTrue(self.sdk.is_input_valid())
+        self.assertEqual(self.sdk.get_left_controller_pose(), [0.0] * 7)
+        self.assertEqual(self.sdk.get_left_grip(), 0.0)
+        self.assertEqual(self.sdk.get_left_trigger(), 0.0)
+        self.assertEqual(self.sdk.get_left_axis(), [0.0, 0.0])
+        self.assertFalse(self.sdk.get_X_button())
+        self.assertEqual(self.sdk.get_right_controller_pose()[0], 2)
+        self.assertEqual(self.sdk.get_right_grip(), 1.0)
+        self.emit(value=frame(3))
+        self.assertEqual(self.sdk.get_left_controller_pose()[0], 3)
 
-    def test_missing_modality_does_not_retain_old_side(self):
+    def test_explicit_invalid_placeholder_is_not_cached(self):
         self.emit()
         value = frame(2)
-        del value["Controller"]["right"]
+        for side in ("left", "right"):
+            value["Controller"][side]["valid"] = False
+            value["Controller"][side]["pose"] = "0,0,0,0,0,0,1"
+        value["Head"] = {"valid": False, "pose": "0,0,0,0,0,0,1"}
         self.emit(value=value)
-        self.assertTrue(self.sdk.is_input_valid())
+        self.assertEqual(self.sdk.get_left_controller_pose(), [0.0] * 7)
         self.assertEqual(self.sdk.get_right_controller_pose(), [0.0] * 7)
+        self.assertEqual(self.sdk.get_headset_pose(), [0.0] * 7)
         self.assertEqual(self.sdk.get_right_grip(), 0.0)
-        self.assertNotIn("right", self.sdk.get_input_snapshot()["data"]["Controller"])
 
     def test_origin_identity_and_inactive_zero_hand_poses_are_not_disconnects(self):
         value = frame(0)
+        value["Controller"]["left"]["valid"] = True
         value["Hand"] = {"leftHand": {"scale": 1.0, "isActive": 0,
             "HandJointLocations": [{"p": "0,0,0,0,0,0,0"}] * 26}}
         self.emit(value=value)
-        self.assertTrue(self.sdk.is_input_valid())
+        self.assertEqual(self.sdk.get_left_controller_pose(), [0.0] * 6 + [1.0])
+        self.assertEqual(self.sdk.get_left_grip(), 1.0)
 
-    def test_manual_rebind_invalidates_and_accepts_only_new_device(self):
-        self.emit()
-        generation = self.sdk.get_input_snapshot()["generation"]
-        self.sdk.set_device_id("headset-B")
-        self.assert_neutral("waiting")
-        self.emit()
-        self.assertFalse(self.sdk.is_input_valid())
-        self.emit("headset-B", frame(2))
-        self.assertEqual(self.sdk.get_time_stamp_ns(), 2)
-        self.assertGreater(self.sdk.get_input_snapshot()["generation"], generation)
-
-    def test_snapshot_is_coherent_and_returns_an_independent_copy(self):
-        self.sdk.set_input_timeout_ms(5000)
+    def test_concurrent_late_callbacks_do_not_repopulate_missing_device(self):
         errors = []
 
         def producer():
             try:
                 for marker in range(1, 201):
                     self.emit(value=frame(marker, marker / 200))
-                    self.emit("headset-B", frame(0))
             except BaseException as error:
                 errors.append(error)
 
         self.emit()
         thread = threading.Thread(target=producer)
         thread.start()
-        for _ in range(300):
-            snapshot = self.sdk.get_input_snapshot()
-            data = snapshot["data"]
-            marker = snapshot["timestamp_ns"]
-            self.assertEqual(data["timeStampNs"], marker)
-            self.assertEqual(float(data["Controller"]["left"]["pose"].split(",")[0]), marker)
-            self.assertEqual(float(data["Controller"]["right"]["pose"].split(",")[0]), marker)
-            snapshot["data"]["Controller"]["left"]["grip"] = -1
+        self.event(1 << 5, "headset-A")
         thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
         self.assertFalse(errors)
-        self.assertGreaterEqual(self.sdk.get_input_snapshot()["data"]["Controller"]["left"]["grip"], 0)
+        self.assert_neutral()
 
-    def test_invalid_configuration_and_duplicate_init(self):
-        for timeout in (0, -1, 2**40):
-            with self.assertRaises((ValueError, OverflowError)):
-                self.sdk.set_input_timeout_ms(timeout)
-        for device in ("x" * 32, "x\0y"):
-            with self.assertRaises(RuntimeError):
-                self.sdk.set_device_id(device)
-        with self.assertRaises(TypeError):
-            self.sdk.set_device_id(b"headset-A")
+    def test_duplicate_init_does_not_clear_active_cache(self):
+        self.emit()
         count = self.native.xrt_test_init_calls()
         with self.assertRaises(RuntimeError):
             self.sdk.init()
         self.assertEqual(self.native.xrt_test_init_calls(), count)
+        self.assertEqual(self.sdk.get_left_grip(), 1.0)
 
-    def test_init_failure_leaves_invalid_cache(self):
+    def test_init_failure_leaves_empty_cache(self):
         self.sdk.close()
         self.native.xrt_test_init_result(-1)
         with self.assertRaises(RuntimeError):
             self.sdk.init()
         self.emit()
-        self.assert_neutral("init_failed")
+        self.assert_neutral()
 
 
 if __name__ == "__main__":
