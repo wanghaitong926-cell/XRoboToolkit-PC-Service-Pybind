@@ -11,475 +11,241 @@
 #include <type_traits>
 #include <vector>
 #include <array>
+#include <algorithm>
+#include <cmath>
 #include <nlohmann/json.hpp>
 #include "PXREARobotSDK.h"
+#include "input_state.h"
 
 
 using json = nlohmann::json;
+InputLifecycle input;
+// Do not hold input.mutex while joining SDK threads that deliver callbacks.
+std::mutex sdkLifecycleMutex;
 
-std::array<double, 7> LeftControllerPose;
-std::array<double, 7> RightControllerPose;
-std::array<double, 7> HeadsetPose;
-
-std::array<std::array<double, 7>, 26> LeftHandTrackingState;
-double LeftHandScale = 1.0;
-int LeftHandIsActive = 0;
-std::array<std::array<double, 7>, 26> RightHandTrackingState;
-double RightHandScale = 1.0;
-int RightHandIsActive = 0;
-
-// Whole body motion data - 24 joints for body tracking
-std::array<std::array<double, 7>, 24> BodyJointsPose;  // Position and rotation for each joint
-std::array<std::array<double, 6>, 24> BodyJointsVelocity;  // Velocity and angular velocity for each joint
-std::array<std::array<double, 6>, 24> BodyJointsAcceleration;  // Acceleration and angular acceleration for each joint
-std::array<int64_t, 24> BodyJointsTimestamp;  // IMU timestamp for each joint
-int64_t BodyTimeStampNs = 0;  // Body data timestamp
-bool BodyDataAvailable = false;  // Flag to indicate if body data is available
-
-std::array<std::array<double, 7>, 3> MotionTrackerPose;  // Position and rotation for each joint
-std::array<std::array<double, 6>, 3> MotionTrackerVelocity;  // Velocity and angular velocity for each joint
-std::array<std::array<double, 6>, 3> MotionTrackerAcceleration;  // Acceleration and angular acceleration for each joint
-std::array<std::string, 3> MotionTrackerSerialNumbers;  // Serial numbers of the motion trackers
-int64_t MotionTimeStampNs = 0;  // Motion data timestamp
-int NumMotionDataAvailable = 0;  // number of motion trackers
-
-
-bool LeftMenuButton;
-double LeftTrigger;
-double LeftGrip;
-std::array<double, 2> LeftAxis{0.0, 0.0};
-bool LeftAxisClick;
-bool LeftPrimaryButton;
-bool LeftSecondaryButton;
-
-bool RightMenuButton;
-double RightTrigger;
-double RightGrip;
-std::array<double, 2> RightAxis{0.0, 0.0};
-bool RightAxisClick;
-bool RightPrimaryButton;
-bool RightSecondaryButton;
-
-int64_t TimeStampNs;
-
-std::mutex leftMutex;
-std::mutex rightMutex;
-std::mutex headsetPoseMutex;
-std::mutex timestampMutex;
-std::mutex leftHandMutex;
-std::mutex rightHandMutex;
-std::mutex bodyMutex;  // Mutex for body tracking data
-std::mutex motionMutex;
-
-
-
-std::array<double, 7> stringToPoseArray(const std::string& poseStr) {
-    std::array<double, 7> result{0};
-    std::stringstream ss(poseStr);
+template <std::size_t N>
+std::array<double, N> stringToArray(const std::string& text) {
+    std::array<double, N> result{};
+    std::stringstream ss(text);
     std::string value;
-    int i = 0;
-    while (std::getline(ss, value, ',') && i < 7) {
-        result[i++] = std::stod(value);
-    }
-    return result;
-}
-
-std::array<double, 6> stringToVelocityArray(const std::string& velocityStr) {
-    std::array<double, 6> result{0};
-    std::stringstream ss(velocityStr);
-    std::string value;
-    int i = 0;
-    while (std::getline(ss, value, ',') && i < 6) {
-        result[i++] = std::stod(value);
-    }
-    return result;
-}
-
-void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int status, void* userData)
-{
-    switch (type)
-    {
-    case PXREAServerConnect:
-        std::cout << "server connect\n" << std::endl;
-        break;
-    case PXREAServerDisconnect:
-        std::cout << "server disconnect\n" << std::endl;
-        break;
-    case PXREADeviceFind:
-        std::cout << "device found\n" << (const char*)userData << std::endl;
-        break;
-    case PXREADeviceMissing:
-        std::cout << "device missing\n" << (const char*)userData << std::endl;
-        break;
-    case PXREADeviceConnect:
-        std::cout << "device connect\n" << (const char*)userData << status << std::endl;
-        break;
-    case PXREADeviceStateJson:
-        auto& dsj = *((PXREADevStateJson*)userData);
-        
-
-        try {
-            json data = json::parse(dsj.stateJson);
-            if (data.contains("value")) {
-                auto value = json::parse(data["value"].get<std::string>());
-                if (value["Controller"].contains("left")) {
-                    auto& left = value["Controller"]["left"];
-                    {
-                        std::lock_guard<std::mutex> lock(leftMutex);
-                        LeftControllerPose = stringToPoseArray(left["pose"].get<std::string>());
-                        LeftTrigger = left["trigger"].get<double>();
-                        LeftGrip = left["grip"].get<double>();
-                        LeftMenuButton = left["menuButton"].get<bool>();
-                        LeftAxis[0] = left["axisX"].get<double>();
-                        LeftAxis[1] = left["axisY"].get<double>();
-                        LeftAxisClick = left["axisClick"].get<bool>();
-                        LeftPrimaryButton = left["primaryButton"].get<bool>();
-                        LeftSecondaryButton = left["secondaryButton"].get<bool>();
-                    }
-                }
-                if (value["Controller"].contains("right")) {
-                    auto& right = value["Controller"]["right"];
-                    {
-                        std::lock_guard<std::mutex> lock(rightMutex);
-                        RightControllerPose = stringToPoseArray(right["pose"].get<std::string>());
-                        RightTrigger = right["trigger"].get<double>();
-                        RightGrip = right["grip"].get<double>();
-                        RightMenuButton = right["menuButton"].get<bool>();
-                        RightAxis[0] = right["axisX"].get<double>();
-                        RightAxis[1] = right["axisY"].get<double>();
-                        RightAxisClick = right["axisClick"].get<bool>();
-                        RightPrimaryButton = right["primaryButton"].get<bool>();
-                        RightSecondaryButton = right["secondaryButton"].get<bool>();
-                    }
-                }
-                if (value.contains("Head")) {
-                    auto& headset = value["Head"];
-                    {
-                        std::lock_guard<std::mutex> lock(headsetPoseMutex);
-                        HeadsetPose = stringToPoseArray(headset["pose"].get<std::string>());
-                    }
-                }
-                if (value.contains("timeStampNs")) {
-                    std::lock_guard<std::mutex> lock(timestampMutex);
-                    TimeStampNs = value["timeStampNs"].get<int64_t>();
-                }
-                if (value["Hand"].contains("leftHand")) {
-                    auto& leftHand = value["Hand"]["leftHand"];
-                    {
-                        std::lock_guard<std::mutex> lock(leftHandMutex);
-                        
-                        LeftHandScale = leftHand["scale"].get<double>();
-                        LeftHandIsActive = leftHand["isActive"].get<int>();
-                        for (int i = 0; i < 26; i++) {
-                            LeftHandTrackingState[i] = stringToPoseArray(leftHand["HandJointLocations"][i]["p"].get<std::string>());
-                        }
-                    }
-                }
-                if (value["Hand"].contains("rightHand")) {
-                    auto& rightHand = value["Hand"]["rightHand"];
-                    {
-                        std::lock_guard<std::mutex> lock(rightHandMutex);
-                        RightHandScale = rightHand["scale"].get<double>();
-                        RightHandIsActive = rightHand["isActive"].get<int>();
-                        for (int i = 0; i < 26; i++) {
-                            RightHandTrackingState[i] = stringToPoseArray(rightHand["HandJointLocations"][i]["p"].get<std::string>());
-                        }
-                    }
-                }
-                // Parse Body data for whole body motion capture
-                if (value.contains("Body")) {
-                    auto& body = value["Body"];
-                    {
-                        std::lock_guard<std::mutex> lock(bodyMutex);
-                        
-                        if (body.contains("timeStampNs")) {
-                            BodyTimeStampNs = body["timeStampNs"].get<int64_t>();
-                        }
-                        
-                        if (body.contains("joints") && body["joints"].is_array()) {
-                            auto joints = body["joints"];
-                            int jointCount = std::min(static_cast<int>(joints.size()), 24);
-                            
-                            for (int i = 0; i < jointCount; i++) {
-                                auto& joint = joints[i];
-                                
-                                // Parse pose (position and rotation)
-                                if (joint.contains("p")) {
-                                    BodyJointsPose[i] = stringToPoseArray(joint["p"].get<std::string>());
-                                }
-                                
-                                // Parse velocity and angular velocity
-                                if (joint.contains("va")) {
-                                    BodyJointsVelocity[i] = stringToVelocityArray(joint["va"].get<std::string>());
-                                }
-                                
-                                // Parse acceleration and angular acceleration
-                                if (joint.contains("wva")) {
-                                    BodyJointsAcceleration[i] = stringToVelocityArray(joint["wva"].get<std::string>());
-                                }
-                                
-                                // Parse IMU timestamp
-                                if (joint.contains("t")) {
-                                    BodyJointsTimestamp[i] = joint["t"].get<int64_t>();
-                                }
-                            }
-                            
-                            BodyDataAvailable = true;
-                        }
-                    }
-                }
-                //parse individual tracker data
-                if (value.contains("Motion")) {
-                    auto& motion = value["Motion"];
-                    {
-                        std::lock_guard<std::mutex> lock(motionMutex);
-                        if (motion.contains("timeStampNs")) {
-                            MotionTimeStampNs = motion["timeStampNs"].get<int64_t>();
-                        }
-                        if (motion.contains("joints") && motion["joints"].is_array()) {
-                            auto joints = motion["joints"];
-                            NumMotionDataAvailable = std::min(static_cast<int>(joints.size()), 3);
-
-                            for (int i = 0; i < NumMotionDataAvailable; i++) {
-                                auto& joint = joints[i];
-
-                                // Parse pose (position and rotation)
-                                if (joint.contains("p")) {
-                                    MotionTrackerPose[i] = stringToPoseArray(joint["p"].get<std::string>());
-                                }
-
-                                // Parse velocity and angular velocity
-                                if (joint.contains("va")) {
-                                    MotionTrackerVelocity[i] = stringToVelocityArray(joint["va"].get<std::string>());
-                                }
-
-                                // Parse acceleration and angular acceleration
-                                if (joint.contains("wva")) {
-                                    MotionTrackerAcceleration[i] = stringToVelocityArray(joint["wva"].get<std::string>());
-                                }
-
-                                if (joint.contains("sn")) {
-                                    MotionTrackerSerialNumbers[i] = joint["sn"].get<std::string>();
-                                }
-                            }
-
-                        }
-                    }
-                }
-            }
-        } catch (const json::exception& e) {
-            std::cerr << "JSON parsing error: " << e.what() << std::endl;
+    std::size_t i = 0;
+    while (std::getline(ss, value, ',')) {
+        if (i >= N) {
+            throw std::invalid_argument("Too many components in XR vector");
         }
-            break;
+        std::size_t used = 0;
+        double component = std::stod(value, &used);
+        if (used != value.size() || !std::isfinite(component)) {
+            throw std::invalid_argument("Invalid component in XR vector");
+        }
+        result[i++] = component;
+    }
+    if (i != N) {
+        throw std::invalid_argument("Incomplete XR vector");
+    }
+    return result;
+}
+
+std::array<double, 7> stringToPoseArray(const std::string& text) {
+    // Tracking quality is modality-specific; inactive hands can contain zero
+    // poses. Receipt validity is not a guarantee of usable tracking.
+    return stringToArray<7>(text);
+}
+
+#include "input_parser.h"
+
+void OnPXREAClientCallback(void*, PXREAClientCallbackType type, int, void* userData) {
+    std::lock_guard<std::mutex> lock(input.mutex);
+    if (!input.initialized) {
+        return;  // Late callbacks during/after close cannot repopulate the cache.
+    }
+    if (type == PXREAServerConnect) {
+        input.serviceConnected = true;
+    } else if (type == PXREAServerDisconnect) {
+        input.serviceConnected = false;
+        input.invalidate("server_disconnected");
+    } else if (type == PXREADeviceMissing) {
+        if (userData && input.deviceId == static_cast<const char*>(userData)) {
+            input.invalidate("device_missing");
+        }
+    } else if (type == PXREADeviceStateJson && userData) {
+        const auto& dsj = *static_cast<PXREADevStateJson*>(userData);
+        const std::string deviceId(dsj.devID,
+            std::find(std::begin(dsj.devID), std::end(dsj.devID), '\0'));
+        if (deviceId.empty() || (!input.deviceId.empty() && input.deviceId != deviceId)) {
+            return;
+        }
+        try {
+            const auto outer = json::parse(std::begin(dsj.stateJson),
+                std::find(std::begin(dsj.stateJson), std::end(dsj.stateJson), '\0'));
+            const auto value = json::parse(outer.at("value").get<std::string>());
+            auto next = parseInput(value);
+            input.expire();
+            if (input.deviceId.empty()) {
+                input.deviceId = deviceId;  // Compatibility: pin first parsed frame.
+                ++input.generation;
+            }
+            input.cache = std::move(next);
+            input.lastFrame = InputLifecycle::Clock::now();
+            input.receivedFrame = true;
+            input.valid = true;
+            input.status = "active";
+        } catch (const std::exception& e) {
+            if (input.deviceId == deviceId) {
+                input.invalidate("invalid_frame");
+            }
+            std::cerr << "XR frame rejected: " << e.what() << std::endl;
+        }
     }
 }
 
 void init() {
+    std::lock_guard<std::mutex> sdkLock(sdkLifecycleMutex);
+    {
+        std::lock_guard<std::mutex> lock(input.mutex);
+        if (input.initialized) {
+            throw std::runtime_error("PXREARobot SDK is already initialized");
+        }
+        input.invalidate("waiting");
+        input.serviceConnected = false;
+        input.initialized = true;
+    }
     if (PXREAInit(NULL, OnPXREAClientCallback, PXREAFullMask) != 0) {
+        std::lock_guard<std::mutex> lock(input.mutex);
+        input.initialized = false;
+        input.invalidate("init_failed");
         throw std::runtime_error("PXREAInit failed");
     }
 }
 
 void deinit() {
-    PXREADeinit();
+    std::lock_guard<std::mutex> sdkLock(sdkLifecycleMutex);
+    bool wasInitialized;
+    {
+        std::lock_guard<std::mutex> lock(input.mutex);
+        wasInitialized = input.initialized;
+        input.initialized = false;
+        input.serviceConnected = false;
+        input.invalidate("closed");
+    }
+    if (wasInitialized) {
+        PXREADeinit();
+    }
 }
 
-std::array<double, 7> getLeftControllerPose() {
-    std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftControllerPose;
+template <typename T>
+T readInput(T CachedInput::*member) {
+    std::lock_guard<std::mutex> lock(input.mutex);
+    input.expire();
+    return input.cache.*member;
 }
 
-std::array<double, 7> getRightControllerPose() {
-    std::lock_guard<std::mutex> lock(rightMutex);
-    return RightControllerPose;
-}
-
-std::array<double, 7> getHeadsetPose() {
-    std::lock_guard<std::mutex> lock(headsetPoseMutex);
-    return HeadsetPose;
-}
-
-double getLeftTrigger() {
-    std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftTrigger;
-}
-
-double getLeftGrip() {
-    std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftGrip;
-}
-
-double getRightTrigger() {
-    std::lock_guard<std::mutex> lock(rightMutex);
-    return RightTrigger;
-}
-
-double getRightGrip() {
-    std::lock_guard<std::mutex> lock(rightMutex);
-    return RightGrip;
-}
-
-bool getLeftMenuButton() {
-    std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftMenuButton;
-}
-
-bool getRightMenuButton() {
-    std::lock_guard<std::mutex> lock(rightMutex);
-    return RightMenuButton;
-}
-
-bool getLeftAxisClick() {
-    std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftAxisClick;
-}
-
-bool getRightAxisClick() {
-    std::lock_guard<std::mutex> lock(rightMutex);
-    return RightAxisClick;
-}
-
-std::array<double, 2> getLeftAxis() {
-    std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftAxis;
-}
-
-
-std::array<double, 2> getRightAxis() {
-    std::lock_guard<std::mutex> lock(rightMutex);
-    return RightAxis;
-}
-
-bool getLeftPrimaryButton() {
-    std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftPrimaryButton;
-}
-
-bool getRightPrimaryButton() {
-    std::lock_guard<std::mutex> lock(rightMutex);
-    return RightPrimaryButton;
-}
-
-bool getLeftSecondaryButton() {
-    std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftSecondaryButton;
-}
-
-bool getRightSecondaryButton() {
-    std::lock_guard<std::mutex> lock(rightMutex);
-    return RightSecondaryButton;
-}
-
-int64_t getTimeStampNs() {
-    std::lock_guard<std::mutex> lock(timestampMutex);
-    return TimeStampNs;
-}
-
+// Preserve legacy getter signatures and return shapes.
+std::array<double, 7> getLeftControllerPose() { return readInput(&CachedInput::LeftControllerPose); }
+std::array<double, 7> getRightControllerPose() { return readInput(&CachedInput::RightControllerPose); }
+std::array<double, 7> getHeadsetPose() { return readInput(&CachedInput::HeadsetPose); }
+double getLeftTrigger() { return readInput(&CachedInput::LeftTrigger); }
+double getLeftGrip() { return readInput(&CachedInput::LeftGrip); }
+double getRightTrigger() { return readInput(&CachedInput::RightTrigger); }
+double getRightGrip() { return readInput(&CachedInput::RightGrip); }
+bool getLeftMenuButton() { return readInput(&CachedInput::LeftMenuButton); }
+bool getRightMenuButton() { return readInput(&CachedInput::RightMenuButton); }
+bool getLeftAxisClick() { return readInput(&CachedInput::LeftAxisClick); }
+bool getRightAxisClick() { return readInput(&CachedInput::RightAxisClick); }
+std::array<double, 2> getLeftAxis() { return readInput(&CachedInput::LeftAxis); }
+std::array<double, 2> getRightAxis() { return readInput(&CachedInput::RightAxis); }
+bool getLeftPrimaryButton() { return readInput(&CachedInput::LeftPrimaryButton); }
+bool getRightPrimaryButton() { return readInput(&CachedInput::RightPrimaryButton); }
+bool getLeftSecondaryButton() { return readInput(&CachedInput::LeftSecondaryButton); }
+bool getRightSecondaryButton() { return readInput(&CachedInput::RightSecondaryButton); }
+int64_t getTimeStampNs() { return readInput(&CachedInput::TimeStampNs); }
 std::array<std::array<double, 7>, 26> getLeftHandTrackingState() {
-    std::lock_guard<std::mutex> lock(leftHandMutex);
-    return LeftHandTrackingState;
+    return readInput(&CachedInput::LeftHandTrackingState);
 }
-
-int getLeftHandScale() {
-    std::lock_guard<std::mutex> lock(leftHandMutex);
-    return LeftHandScale;
-}
-
-int getLeftHandIsActive() {
-    std::lock_guard<std::mutex> lock(leftHandMutex);
-    return LeftHandIsActive;
-}
-
+int getLeftHandScale() { return readInput(&CachedInput::LeftHandScale); }
+int getLeftHandIsActive() { return readInput(&CachedInput::LeftHandIsActive); }
 std::array<std::array<double, 7>, 26> getRightHandTrackingState() {
-    std::lock_guard<std::mutex> lock(rightHandMutex);
-    return RightHandTrackingState;
+    return readInput(&CachedInput::RightHandTrackingState);
 }
-
-int getRightHandScale() {
-    std::lock_guard<std::mutex> lock(rightHandMutex);
-    return RightHandScale;
-}
-
-int getRightHandIsActive() {
-    std::lock_guard<std::mutex> lock(rightHandMutex);
-    return RightHandIsActive;
-}
-
-// Body tracking functions
-bool isBodyDataAvailable() {
-    std::lock_guard<std::mutex> lock(bodyMutex);
-    return BodyDataAvailable;
-}
-
+int getRightHandScale() { return readInput(&CachedInput::RightHandScale); }
+int getRightHandIsActive() { return readInput(&CachedInput::RightHandIsActive); }
+bool isBodyDataAvailable() { return readInput(&CachedInput::BodyDataAvailable); }
 std::array<std::array<double, 7>, 24> getBodyJointsPose() {
-    std::lock_guard<std::mutex> lock(bodyMutex);
-    return BodyJointsPose;
+    return readInput(&CachedInput::BodyJointsPose);
 }
-
 std::array<std::array<double, 6>, 24> getBodyJointsVelocity() {
-    std::lock_guard<std::mutex> lock(bodyMutex);
-    return BodyJointsVelocity;
+    return readInput(&CachedInput::BodyJointsVelocity);
 }
-
 std::array<std::array<double, 6>, 24> getBodyJointsAcceleration() {
-    std::lock_guard<std::mutex> lock(bodyMutex);
-    return BodyJointsAcceleration;
+    return readInput(&CachedInput::BodyJointsAcceleration);
 }
+std::array<int64_t, 24> getBodyJointsTimestamp() { return readInput(&CachedInput::BodyJointsTimestamp); }
+int64_t getBodyTimeStampNs() { return readInput(&CachedInput::BodyTimeStampNs); }
+int numMotionDataAvailable() { return readInput(&CachedInput::NumMotionDataAvailable); }
 
-std::array<int64_t, 24> getBodyJointsTimestamp() {
-    std::lock_guard<std::mutex> lock(bodyMutex);
-    return BodyJointsTimestamp;
-}
-
-int64_t getBodyTimeStampNs() {
-    std::lock_guard<std::mutex> lock(bodyMutex);
-    return BodyTimeStampNs;
-}
-
-int numMotionDataAvailable() {
-    std::lock_guard<std::mutex> lock(motionMutex);
-    return NumMotionDataAvailable;
+template <typename T>
+std::vector<T> readMotion(std::array<T, 3> CachedInput::*member) {
+    std::lock_guard<std::mutex> lock(input.mutex);
+    input.expire();
+    const auto& values = input.cache.*member;
+    return {values.begin(), values.begin() + input.cache.NumMotionDataAvailable};
 }
 
 std::vector<std::array<double, 7>> getMotionTrackerPose() {
-    std::lock_guard<std::mutex> lock(motionMutex);
-    std::vector<std::array<double, 7>> result;
-    for (int i = 0; i < NumMotionDataAvailable; i++) {
-        result.push_back(MotionTrackerPose[i]);
-    }
-    return result;
+    return readMotion(&CachedInput::MotionTrackerPose);
 }
-
 std::vector<std::array<double, 6>> getMotionTrackerVelocity() {
-    std::lock_guard<std::mutex> lock(motionMutex);
-    std::vector<std::array<double, 6>> result;
-    for (int i = 0; i < NumMotionDataAvailable; i++) {
-        result.push_back(MotionTrackerVelocity[i]);
-    }
-    return result;
+    return readMotion(&CachedInput::MotionTrackerVelocity);
 }
-
 std::vector<std::array<double, 6>> getMotionTrackerAcceleration() {
-    std::lock_guard<std::mutex> lock(motionMutex);
-    std::vector<std::array<double, 6>> result;
-    for (int i = 0; i < NumMotionDataAvailable; i++) {
-        result.push_back(MotionTrackerAcceleration[i]);
-    }
-    return result;
+    return readMotion(&CachedInput::MotionTrackerAcceleration);
 }
-
 std::vector<std::string> getMotionTrackerSerialNumbers() {
-    std::lock_guard<std::mutex> lock(motionMutex);
-    std::vector<std::string> result;
-    for (int i = 0; i < NumMotionDataAvailable; i++) {
-        result.push_back(MotionTrackerSerialNumbers[i]);
+    return readMotion(&CachedInput::MotionTrackerSerialNumbers);
+}
+int64_t getMotionTimeStampNs() { return readInput(&CachedInput::MotionTimeStampNs); }
+
+void setDeviceId(const std::string& deviceId) {
+    if (deviceId.size() >= 32 || deviceId.find('\0') != std::string::npos) {
+        throw std::invalid_argument("device_id must contain at most 31 bytes and no NUL");
     }
-    return result;
+    std::lock_guard<std::mutex> lock(input.mutex);
+    input.deviceId = deviceId;
+    input.invalidate(input.initialized ? "waiting" : "uninitialized");
 }
 
-int64_t getMotionTimeStampNs() {
-    std::lock_guard<std::mutex> lock(motionMutex);
-    return MotionTimeStampNs;
+void setInputTimeoutMs(int timeoutMs) {
+    if (timeoutMs <= 0) {
+        throw std::invalid_argument("timeout_ms must be positive");
+    }
+    std::lock_guard<std::mutex> lock(input.mutex);
+    // Increasing a deadline must not revive data that already expired.
+    input.expire();
+    input.timeoutMs = timeoutMs;
+    input.expire();
+}
+
+bool isInputValid() {
+    std::lock_guard<std::mutex> lock(input.mutex);
+    input.expire();
+    return input.valid;
+}
+
+json getInputSnapshot() {
+    std::lock_guard<std::mutex> lock(input.mutex);
+    input.expire();
+    json age = nullptr;
+    if (input.receivedFrame) {
+        age = std::chrono::duration<double, std::milli>(
+            InputLifecycle::Clock::now() - input.lastFrame).count();
+    }
+    return {
+        {"device_id", input.deviceId}, {"valid", input.valid},
+        {"status", input.status}, {"generation", input.generation},
+        {"service_connected", input.serviceConnected}, {"age_ms", age},
+        {"timeout_ms", input.timeoutMs}, {"timestamp_ns", input.cache.TimeStampNs},
+        {"data", input.cache.data}
+    };
 }
 
 int DeviceControlJsonWrapper(const std::string& dev_id, const std::string& json_str) {
@@ -508,6 +274,23 @@ int SendBytesToDeviceWrapper(const std::string& dev_id, const std::string& blob)
 // ---------------------------------------------------------------------------
 
 namespace {
+
+PyObject* toPython(const json& value) {
+    // Use public Limited API calls, retaining the cp310-abi3 wheel target.
+    const auto serialized = value.dump();
+    PyObject* module = PyImport_ImportModule("json");
+    if (module == nullptr) {
+        return nullptr;
+    }
+    PyObject* loads = PyObject_GetAttrString(module, "loads");
+    Py_DECREF(module);
+    if (loads == nullptr) {
+        return nullptr;
+    }
+    PyObject* result = PyObject_CallFunction(loads, "s", serialized.c_str());
+    Py_DECREF(loads);
+    return result;
+}
 
 template <typename T>
 PyObject* toPython(const T& value) {
@@ -592,6 +375,36 @@ bool toStdString(PyObject* obj, std::string& out) {
     return true;
 }
 
+PyObject* pySetDeviceId(PyObject*, PyObject* arg) {
+    if (!PyUnicode_Check(arg)) {
+        PyErr_SetString(PyExc_TypeError, "device_id must be a string");
+        return nullptr;
+    }
+    return translateExceptions([&]() -> PyObject* {
+        std::string deviceId;
+        if (!toStdString(arg, deviceId)) {
+            return nullptr;
+        }
+        setDeviceId(deviceId);
+        Py_RETURN_NONE;
+    });
+}
+
+PyObject* pySetInputTimeoutMs(PyObject*, PyObject* arg) {
+    long timeout = PyLong_AsLong(arg);
+    if (PyErr_Occurred()) {
+        return nullptr;
+    }
+    if (timeout <= 0 || timeout > 2147483647L) {
+        PyErr_SetString(PyExc_ValueError, "timeout_ms must be between 1 and 2147483647");
+        return nullptr;
+    }
+    return translateExceptions([&]() -> PyObject* {
+        setInputTimeoutMs(static_cast<int>(timeout));
+        Py_RETURN_NONE;
+    });
+}
+
 PyObject* pyDeviceControlJson(PyObject* /*module*/, PyObject* args) {
     PyObject* devId;
     PyObject* jsonStr;
@@ -631,6 +444,12 @@ PyObject* pySendBytesToDevice(PyObject* /*module*/, PyObject* args) {
 PyMethodDef kMethods[] = {
     XRT_FUNCTION("init", init, "None", "Initialize the PXREARobot SDK."),
     XRT_FUNCTION("close", deinit, "None", "Deinitialize the PXREARobot SDK."),
+    {"set_device_id", pySetDeviceId, METH_O,
+     "set_device_id(device_id: str, /) -> None\n\nSelect a device and invalidate cached input; empty string enables first-frame binding."},
+    {"set_input_timeout_ms", pySetInputTimeoutMs, METH_O,
+     "set_input_timeout_ms(timeout_ms: int, /) -> None\n\nSet the positive monotonic frame receipt deadline (default 500 ms)."},
+    XRT_FUNCTION("is_input_valid", isInputValid, "bool", "Whether selected input has a parsed, unexpired frame."),
+    XRT_FUNCTION("get_input_snapshot", getInputSnapshot, "dict", "Get one coherent frame with device, validity and lifecycle metadata."),
     XRT_FUNCTION("get_left_controller_pose", getLeftControllerPose, "list[float]", "Get the left controller pose."),
     XRT_FUNCTION("get_right_controller_pose", getRightControllerPose, "list[float]", "Get the right controller pose."),
     XRT_FUNCTION("get_headset_pose", getHeadsetPose, "list[float]", "Get the headset pose."),

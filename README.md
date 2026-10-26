@@ -50,6 +50,102 @@ Wheels for Linux/Windows are also built in CI via cibuildwheel, see
 
 ## Using the Python Bindings
 
+### Selecting a device and checking input freshness
+
+```python
+import xrobotoolkit_sdk as xrt
+
+xrt.set_device_id("YOUR_HEADSET_DEVICE_ID")  # SDK devID, not an IP address
+xrt.set_input_timeout_ms(500)
+xrt.init()
+try:
+    snapshot = xrt.get_input_snapshot()
+    if snapshot["valid"]:
+        # All fields in data come from the same device and complete message.
+        controllers = snapshot["data"].get("Controller", {})
+        left = controllers.get("left")
+        right = controllers.get("right")
+        if left is not None and right is not None:
+            left_pose = [float(v) for v in left["pose"].split(",")]
+            right_pose = [float(v) for v in right["pose"].split(",")]
+            left_grip = left["grip"]
+            right_grip = right["grip"]
+            # Check tracking quality and application takeover state before use.
+finally:
+    xrt.close()
+```
+
+`set_device_id()` selects the only device allowed to publish input. Device IDs
+are the SDK's `devID` values (at most 31 UTF-8 bytes), as reported by the PC
+Service. For compatibility, an unconfigured `init()` pins the first successfully
+parsed frame's nonempty device ID. This prevents mixing but cannot determine
+which headset an operator intended to use: **set an explicit ID when multiple
+devices are present**.
+
+The binding survives missing-device events, stale input, service reconnects and
+`close()` / `init()`. It never automatically switches to another headset.
+Calling `set_device_id("OTHER_ID")` explicitly switches and invalidates input;
+calling `set_device_id("")` explicitly permits first-frame binding again.
+
+`get_input_snapshot()` returns:
+
+- `device_id`: selected SDK identity.
+- `valid`: a successfully parsed, unexpired message is available.
+- `status`: `uninitialized`, `waiting`, `active`, `stale`, `device_missing`,
+  `server_disconnected`, `invalid_frame`, `init_failed` or `closed`.
+- `generation`: increases on binding or invalidation. Applications can detect a
+  discontinuity even if fresh data arrived before the next read.
+- `service_connected`: last SDK service-connect/disconnect event state;
+  it is not a headset tracking-quality indicator.
+- `age_ms`: elapsed **local steady-clock** time since the last accepted frame,
+  or `None` when no receipt is retained. Unrelated-device frames do not refresh it.
+- `timeout_ms`: positive receipt deadline, default 500 ms.
+- `timestamp_ns`: selected message's source timestamp, or zero when invalid.
+- `data`: decoded `value` object from that one message; pose fields retain the
+  wire format (comma-separated strings). An invalid snapshot contains `{}`.
+
+`is_input_valid()` provides the same validity check without copying a snapshot.
+Receipt expiry is checked on every read and before publishing the next accepted
+frame; it requires no watchdog thread.
+
+**Disconnect detection is separate from freshness.** `device_missing` is set
+only for a matching `PXREADeviceMissing` event; `server_disconnected` is set for
+`PXREAServerDisconnect`. In the current upstream PC Service,
+`TcpServerWorker::onCheckConnection()` reports a missing device after more than
+20 seconds without a device heartbeat. That is a service-reported timeout, not
+proof that a headset has physically powered off. The shorter configurable
+receipt deadline marks input `stale` without declaring a transport disconnect.
+It uses local receipt time, not the headset's clock.
+
+Existing getter names, no-argument signatures and return shapes remain. Their
+behavior intentionally changes: unrelated devices cannot overwrite them;
+missing fields start at neutral values each frame; and invalidated/expired
+poses, buttons, grips, timestamps and tracking caches return neutral defaults
+instead of retaining the last values. Separate legacy getter calls can still
+span two accepted frames, so use `get_input_snapshot()` for a coherent read.
+Calling `init()` twice without `close()` now raises; `close()` is idempotent.
+
+Validity means a parsed message is fresh, **not** that all controllers are
+tracked, that source timestamps are progressing, or that robot motion may
+resume. A neutral pose is not a valid control target. Consumers must inhibit
+control when input is invalid, inspect modality presence/tracking quality, and
+require their own release/re-arm/takeover procedure after a generation change.
+The SDK does not move a robot or establish a new takeover reference.
+
+### Offline API regression
+
+On Linux or macOS with Python >= 3.10 and a C++17 compiler:
+
+```bash
+python tests/run_input_regression.py
+```
+
+This compiles the real binding with `Py_LIMITED_API=0x030A0000` against a
+test-only SDK ABI replacement, injects interleaved device frames and lifecycle
+events, and exercises the Python APIs. It opens no SDK socket or hardware
+connection and builds only in a temporary directory. macOS is supported for
+this fake-SDK regression, not for production SDK wheels.
+
 **1. Get Controller and Headset Poses**
 
 ```python
